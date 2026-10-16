@@ -106,29 +106,44 @@ pub struct CrawlListData {
   pub provider: String,
 }
 
+/// 反序列化辅助：把 JSON `null` 视为「字段缺失」，回退到类型的默认值。
+///
+/// OpenList 在**空目录**时返回 `"content": null`，而不是 `[]`；`readme` / `header` /
+/// `provider` 等字段也可能为 `null`。`#[serde(default)]` 只对**缺失的字段**生效，
+/// 遇到显式 `null` 会直接报错并让整条响应解析失败（前端表现为
+/// `error decoding response body`），因此这些字段统一走本函数。
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+  D: serde::Deserializer<'de>,
+  T: Deserialize<'de> + Default,
+{
+  Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// 接口原始返回的目录数据
 ///
 /// `content` 保留为未加工的 JSON：接口只返回 `name`，不含 `path` / `parent`，
 /// 直接反序列化成 [`CrawlEntry`] 会因为缺字段而失败，因此先取原始值再补全。
 #[derive(Debug, Clone, Deserialize)]
 struct RawListData {
-  #[serde(default)]
+  #[serde(default, deserialize_with = "null_as_default")]
   content: Vec<serde_json::Value>,
-  #[serde(default)]
+  #[serde(default, deserialize_with = "null_as_default")]
   total: u64,
-  #[serde(default)]
+  #[serde(default, deserialize_with = "null_as_default")]
   readme: String,
-  #[serde(default)]
+  #[serde(default, deserialize_with = "null_as_default")]
   header: String,
-  #[serde(default)]
+  #[serde(default, deserialize_with = "null_as_default")]
   provider: String,
 }
 
 /// 接口原始响应
 #[derive(Debug, Clone, Deserialize)]
 struct RawListResponse {
+  #[serde(default, deserialize_with = "null_as_default")]
   code: i32,
-  #[serde(default)]
+  #[serde(default, deserialize_with = "null_as_default")]
   message: String,
   #[serde(default)]
   data: Option<RawListData>,
@@ -542,5 +557,94 @@ mod tests {
   fn urlencoding_escapes_sign() {
     assert_eq!(urlencoding("a=b:c/d"), "a%3Db%3Ac%2Fd");
     assert_eq!(urlencoding("abc-_.~"), "abc-_.~");
+  }
+
+  /// 回归测试：空目录时接口返回 `"content": null`（真实响应抓取自 /常驻生存服），
+  /// 修复前会反序列化失败并报 `error decoding response body`。
+  #[test]
+  fn empty_directory_with_null_content_is_tolerated() {
+    let payload = r#"{"code":200,"message":"success","data":{"content":null,"total":0,"readme":"","header":"","write":false,"provider":"unknown"}}"#;
+    let raw: RawListResponse =
+      serde_json::from_str(payload).expect("空目录响应必须能解析（content 为 null）");
+    assert_eq!(raw.code, 200);
+    assert_eq!(raw.message, "success");
+    let data = raw.data.expect("data 应当存在");
+    assert!(data.content.is_empty(), "null 应回退为空列表");
+    assert_eq!(data.total, 0);
+  }
+
+  /// 全部字段为 `null` 时也应回退到默认值，而不是解析失败。
+  #[test]
+  fn null_fields_fall_back_to_defaults() {
+    let payload = r#"{"code":null,"message":null,"data":{"content":null,"total":null,"readme":null,"header":null,"provider":null}}"#;
+    let raw: RawListResponse = serde_json::from_str(payload).expect("含 null 字段的响应必须能解析");
+    assert_eq!(raw.code, 0);
+    assert_eq!(raw.message, "");
+    let data = raw.data.expect("data 应当存在");
+    assert!(data.content.is_empty());
+    assert_eq!(data.total, 0);
+    assert_eq!(data.readme, "");
+    assert_eq!(data.header, "");
+    assert_eq!(data.provider, "");
+  }
+
+  /// 普通（非空）目录仍应正常解析，避免修复引入回归。
+  #[test]
+  fn normal_directory_still_parses() {
+    let payload = r#"{"code":200,"message":"success","data":{"content":[{"name":"0.2.0","size":0,"is_dir":true,"modified":"2026-10-06T12:00:00Z","created":"","sign":"","thumb":"","type":1}],"total":1,"readme":"","header":"","provider":"unknown"}}"#;
+    let raw: RawListResponse = serde_json::from_str(payload).expect("普通目录响应必须能解析");
+    assert_eq!(raw.code, 200);
+    let data = raw.data.expect("data 应当存在");
+    assert_eq!(data.content.len(), 1);
+    assert_eq!(data.total, 1);
+  }
+
+  /// 条目规范化：补全 `path` / `parent` 并推断文件类型。
+  #[test]
+  fn normalize_entry_fills_path_and_type() {
+    let dir = serde_json::json!({ "name": "XMCL", "is_dir": true, "size": 0 });
+    let entry = Crawler::normalize_entry("/", &dir).expect("目录条目应能规范化");
+    assert_eq!(entry.path, "/XMCL");
+    assert_eq!(entry.parent, "/");
+    assert!(entry.is_dir);
+    assert_eq!(entry.file_type, 1);
+
+    let file = serde_json::json!({ "name": "a.zip", "is_dir": false, "size": 123 });
+    let entry = Crawler::normalize_entry("/XMCL/0.2.0", &file).expect("文件条目应能规范化");
+    assert_eq!(entry.path, "/XMCL/0.2.0/a.zip");
+    assert_eq!(entry.parent, "/XMCL/0.2.0");
+    assert_eq!(entry.size, 123);
+    assert!(!entry.is_dir);
+  }
+
+  /// 真实站点冒烟测试：直接抓取一个**空目录**，确认端到端不再报解析错误。
+  ///
+  /// 默认被忽略（需要联网）。手动运行：
+  /// `cargo test --release --lib -- openlist --ignored --nocapture`
+  #[ignore = "需要访问真实站点，默认不执行"]
+  #[tokio::test]
+  async fn live_empty_directory_smoke() {
+    let client = reqwest::Client::builder()
+      .no_proxy()
+      .timeout(REQUEST_TIMEOUT)
+      .build()
+      .expect("构造 HTTP 客户端失败");
+    let crawler = Crawler::new(&client);
+
+    let empty = crawler
+      .fetch_dir("/常驻生存服", 1, 100)
+      .await
+      .expect("空目录必须能正常抓取（content 为 null 时不得报错）");
+    assert_eq!(empty.code, 200, "站点应返回 200");
+    let data = empty.data.expect("空目录也应返回 data");
+    assert!(data.content.is_empty(), "空目录应得到空列表");
+
+    // 对照：非空目录仍应正常返回条目
+    let non_empty = crawler
+      .fetch_dir("/XMCL", 1, 100)
+      .await
+      .expect("非空目录必须能正常抓取");
+    assert_eq!(non_empty.code, 200);
+    assert!(!non_empty.data.expect("应有 data").content.is_empty());
   }
 }
