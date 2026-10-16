@@ -145,6 +145,8 @@ pub async fn run() {
       resource::commands::update_mods,
       resource::commands::fetch_remote_resource_by_id,
       openlist::commands::openlist_browse,
+      openlist::commands::openlist_crawl_tree,
+      openlist::commands::openlist_crawl_search,
       openlist::commands::openlist_download_modpack,
       tasks::commands::schedule_progressive_task_group,
       tasks::commands::cancel_progressive_task,

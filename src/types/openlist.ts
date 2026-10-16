@@ -33,8 +33,10 @@ export interface StorageDetails {
 export interface FsObject {
   /** 对象 ID（本地存储可能为空） */
   id: string;
-  /** 完整系统路径 */
+  /** 相对站点根目录的完整路径，由后端抓取时补全，例如 `/XMCL/0.2.0/xxx.zip` */
   path: string;
+  /** 所在父目录路径，由后端抓取时补全 */
+  parent?: string;
   /** 文件或目录名称 */
   name: string;
   /** 文件大小（字节），目录为 0 */

@@ -7,12 +7,17 @@ import {
   Button,
   Grid,
   GridItem,
+  HStack,
+  Icon,
+  Input,
+  InputGroup,
+  InputLeftElement,
   VStack,
   useToast,
 } from "@chakra-ui/react";
 import { invoke } from "@tauri-apps/api/core";
 import React, { useCallback, useEffect, useState } from "react";
-import { FiChevronLeft } from "react-icons/fi";
+import { FiChevronLeft, FiSearch, FiX } from "react-icons/fi";
 import { Section } from "@/components/common/section";
 import { ModpackDetail } from "@/components/openlist/modpack-detail";
 import { ModpackList } from "@/components/openlist/modpack-list";
@@ -26,6 +31,8 @@ export default function OpenListPage() {
   const [loading, setLoading] = useState<boolean>(false);
   const [selectedItem, setSelectedItem] = useState<FsObject | null>(null);
   const [searchQuery, setSearchQuery] = useState<string>("");
+  const [searchMode, setSearchMode] = useState<boolean>(false);
+  const [searching, setSearching] = useState<boolean>(false);
   const [showDetailPanel, setShowDetailPanel] = useState<boolean>(false);
 
   const toast = useToast();
@@ -121,8 +128,14 @@ export default function OpenListPage() {
       console.log(`[handleSelectItem] Is directory: ${item.is_dir}`);
 
       if (item.is_dir) {
+        // 进入目录时退出搜索结果视图
+        setSearchMode(false);
+        // 后端抓取时已补全完整路径，优先使用；缺失时按当前路径拼接兜底
         const newPath =
-          currentPath === "/" ? `/${item.name}` : `${currentPath}/${item.name}`;
+          item.path ||
+          (currentPath === "/"
+            ? `/${item.name}`
+            : `${currentPath}/${item.name}`);
 
         console.log(
           `[handleSelectItem] ========== ENTERING DIRECTORY ==========`
@@ -177,46 +190,66 @@ export default function OpenListPage() {
   );
 
   /**
-   * 搜索
+   * 退出全站搜索，回到当前目录
+   */
+  const handleExitSearch = useCallback(() => {
+    setSearchQuery("");
+    setSearchMode(false);
+    loadDirectory(currentPath);
+  }, [currentPath, loadDirectory]);
+
+  /**
+   * 全站搜索
+   *
+   * 由 Rust 后端递归遍历站点目录树后按文件名匹配，因此可以命中任意层级
+   * 子目录中的文件，而不像目录内过滤那样只能看到当前层级。
    */
   const handleSearch = useCallback(
     async (query: string) => {
-      if (!query.trim()) {
-        loadDirectory(currentPath);
+      const keyword = query.trim();
+      if (!keyword) {
+        handleExitSearch();
         return;
       }
 
-      setLoading(true);
+      setSearching(true);
+      setSelectedItem(null);
+      setShowDetailPanel(false);
+
       try {
-        const response = await invoke<any>("openlist_browse", {
-          request: {
-            path: currentPath || "/",
-            page: 1,
-            perPage: 100,
-          },
+        const results = await invoke<FsObject[]>("openlist_crawl_search", {
+          keyword,
+          root: "/",
+          maxDepth: 6,
+          maxResults: 300,
         });
 
-        if (response.code === 200 && response.data) {
-          const filtered = response.data.content.filter((item: any) =>
-            item.name.toLowerCase().includes(query.toLowerCase())
-          );
-          setItems(filtered);
-        } else {
-          setItems([]);
+        setItems(results || []);
+        setSearchMode(true);
+
+        if (!results || results.length === 0) {
+          toast({
+            title: "未找到匹配文件",
+            description: `全站搜索「${keyword}」没有结果`,
+            status: "info",
+            duration: 3000,
+            isClosable: true,
+          });
         }
       } catch (error) {
-        console.error("Search failed:", error);
+        console.error("[handleSearch] 全站搜索失败:", error);
         toast({
           title: "搜索失败",
-          description: "无法执行搜索",
+          description: `无法完成全站搜索: ${String(error)}`,
           status: "error",
-          duration: 3000,
+          duration: 5000,
+          isClosable: true,
         });
       } finally {
-        setLoading(false);
+        setSearching(false);
       }
     },
-    [currentPath, loadDirectory, toast]
+    [handleExitSearch, toast]
   );
 
   /**
@@ -226,8 +259,11 @@ export default function OpenListPage() {
     async (item: FsObject) => {
       if (!item) return;
 
+      // 优先使用后端补全的完整路径：搜索结果里的条目可能来自任意子目录，
+      // 用 currentPath 拼接会得到错误路径。
       const fullFilePath =
-        currentPath === "/" ? `/${item.name}` : `${currentPath}/${item.name}`;
+        item.path ||
+        (currentPath === "/" ? `/${item.name}` : `${currentPath}/${item.name}`);
 
       console.log("[handleDownload] Starting download");
       console.log("  - File name:", item.name);
@@ -373,12 +409,58 @@ export default function OpenListPage() {
 
         {/* 主内容区域 */}
         <Grid templateColumns="repeat(12, 1fr)" gap={6}>
-          {/* 文件列表 */}
+          {/* 文件列表 / 搜索结果 */}
           <GridItem colSpan={showDetailPanel && selectedItem ? 7 : 12}>
-            <Section title={currentPath === "/" ? "文件列表" : currentPath}>
+            <Section
+              title={
+                searchMode
+                  ? `全站搜索：${searchQuery.trim()}`
+                  : currentPath === "/"
+                    ? "文件列表"
+                    : currentPath
+              }
+              headExtra={
+                <HStack spacing={2}>
+                  <InputGroup size="sm" width="240px">
+                    <InputLeftElement pointerEvents="none">
+                      <Icon as={FiSearch} color="gray.400" />
+                    </InputLeftElement>
+                    <Input
+                      placeholder="搜索整站文件..."
+                      value={searchQuery}
+                      isDisabled={searching}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          handleSearch(searchQuery);
+                        }
+                      }}
+                    />
+                  </InputGroup>
+                  <Button
+                    size="sm"
+                    colorScheme={primaryColor}
+                    isLoading={searching}
+                    onClick={() => handleSearch(searchQuery)}
+                  >
+                    搜索
+                  </Button>
+                  {(searchMode || searchQuery) && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      leftIcon={<FiX />}
+                      onClick={handleExitSearch}
+                    >
+                      退出
+                    </Button>
+                  )}
+                </HStack>
+              }
+            >
               <ModpackList
                 items={items}
-                loading={loading}
+                loading={loading || searching}
                 selectedItem={selectedItem}
                 onSelect={handleSelectItem}
                 onDownload={handleDownload}

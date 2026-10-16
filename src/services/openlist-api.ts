@@ -1,25 +1,37 @@
 /**
- * OpenList API 客户端服务
- * 提供与 OpenList API 的所有交互接口
+ * CAUCraft 下载站（OpenList）服务层
  *
- * 通过 Rust 后端代理所有请求以避免 CORS 和 HTTP 插件问题
+ * 站点前端是一个 SPA，页面 HTML 中不含任何文件数据，目录内容全部由浏览器
+ * 在运行时通过站点自身的 HTTP 接口拉取。因此这里统一走站点接口，并全部经由
+ * Rust 后端代理 —— 既能规避浏览器 CORS / 混合内容限制，也便于统一处理
+ * 站点地址与错误。
  */
 import { invoke } from "@tauri-apps/api/core";
 import type { FsListRequest, FsListResponse, FsObject } from "@/types/openlist";
 
-// OpenList 服务器地址（从环境变量读取）
-const OPENLIST_BASE_URL =
-  process.env.NEXT_PUBLIC_OPENLIST_BASE_URL || "https://shindobaddo.cauc.fun";
+/**
+ * 下载站地址
+ *
+ * 仅用于展示与兜底；真正的请求地址由 Rust 后端解析
+ * （后端会优先读取编译期注入的 `XMCL_OPENLIST_BASE_URL`，为空则回退内置默认值）。
+ */
+export const OPENLIST_BASE_URL =
+  process.env.NEXT_PUBLIC_OPENLIST_BASE_URL || "http://download.cauc.fun";
+
+/** 目录树遍历默认最大深度 */
+export const DEFAULT_MAX_DEPTH = 6;
+/** 全站搜索默认最多返回条数 */
+export const DEFAULT_MAX_RESULTS = 300;
 
 /**
- * OpenList API 客户端类
+ * 下载站接口客户端
  */
 export class OpenListAPI {
   /**
    * 列出目录内容（通过 Rust 后端代理）
    */
   async list(request: FsListRequest): Promise<FsListResponse> {
-    console.log("[OpenList API] Calling Rust backend:", request);
+    console.log("[download-site] 请求目录:", request);
 
     try {
       const response = await invoke<FsListResponse>("openlist_browse", {
@@ -30,78 +42,106 @@ export class OpenListAPI {
         },
       });
 
-      console.log("[OpenList API] Rust backend response:", response);
       console.log(
-        "[OpenList API] Items count:",
+        "[download-site] 返回 code:",
+        response.code,
+        "条目数:",
         response.data?.content?.length || 0
       );
 
       return response;
     } catch (error) {
-      console.error("[OpenList API] Rust backend call failed:", error);
-      throw new Error(`OpenList API 调用失败: ${error}`);
+      console.error("[download-site] 请求目录失败:", error);
+      throw new Error(`下载站请求失败: ${error}`);
     }
   }
 
   /**
-   * 浏览指定路径(简化版)
+   * 浏览指定路径
    * @param path 路径
    * @param page 页码
    * @param perPage 每页数量
-   * @returns 目录内容
    */
   async browse(
     path: string = "/",
     page: number = 1,
     perPage: number = 100
   ): Promise<FsListResponse> {
-    return this.list({
-      path,
-      page,
-      per_page: perPage,
-    });
+    return this.list({ path, page, per_page: perPage });
   }
 
   /**
-   * 搜索文件/文件夹
-   * @param basePath 搜索的基础路径
-   * @param query 搜索关键词
-   * @returns 搜索结果(FsObject 数组)
+   * 在当前目录内按名称过滤（本地过滤，不产生额外请求）
+   * @param basePath 基础路径
+   * @param query 关键词
    */
   async search(basePath: string, query: string): Promise<FsObject[]> {
-    console.log(`[OpenList API] Searching in ${basePath} for: ${query}`);
-
-    try {
-      // 获取当前路径的所有内容
-      const response = await this.browse(basePath);
-
-      if (response.code !== 200 || !response.data) {
-        console.error("[OpenList API] Search failed: invalid response");
-        return [];
-      }
-
-      // 在前端进行简单的名称过滤
-      const filtered = response.data.content.filter((item) =>
-        item.name.toLowerCase().includes(query.toLowerCase())
-      );
-
-      console.log(
-        `[OpenList API] Search found ${filtered.length} items matching "${query}"`
-      );
-      return filtered;
-    } catch (error) {
-      console.error("[OpenList API] Search error:", error);
-      throw error;
+    const response = await this.browse(basePath);
+    if (response.code !== 200 || !response.data) {
+      return [];
     }
+    const keyword = query.toLowerCase();
+    return response.data.content.filter((item) =>
+      item.name.toLowerCase().includes(keyword)
+    );
   }
 
   /**
-   * 下载文件到临时目录（支持断点续传）
+   * 全站搜索
+   *
+   * 由后端递归遍历目录树后按文件名匹配，因此可以命中子目录中的文件，
+   * 不像目录内过滤那样只能看到当前层级。
+   * @param keyword 关键词
+   * @param root 搜索起始路径
+   * @param maxDepth 最大遍历深度
+   * @param maxResults 最多返回条数
+   */
+  async searchAll(
+    keyword: string,
+    root: string = "/",
+    maxDepth: number = DEFAULT_MAX_DEPTH,
+    maxResults: number = DEFAULT_MAX_RESULTS
+  ): Promise<FsObject[]> {
+    if (!keyword.trim()) {
+      return [];
+    }
+
+    console.log(`[download-site] 全站搜索 "${keyword}"，起始于 ${root}`);
+
+    const results = await invoke<FsObject[]>("openlist_crawl_search", {
+      keyword,
+      root,
+      maxDepth,
+      maxResults,
+    });
+
+    console.log(`[download-site] 全站搜索命中 ${results?.length || 0} 个文件`);
+    return results || [];
+  }
+
+  /**
+   * 递归遍历目录树，返回其中的所有文件
+   * @param path 起始路径
+   * @param maxDepth 最大遍历深度
+   */
+  async crawlTree(
+    path: string = "/",
+    maxDepth: number = DEFAULT_MAX_DEPTH
+  ): Promise<FsObject[]> {
+    const results = await invoke<FsObject[]>("openlist_crawl_tree", {
+      path,
+      maxDepth,
+    });
+    return results || [];
+  }
+
+  /**
+   * 下载文件到本地（支持断点续传）
    * @param fileName 文件名
-   * @param filePath 文件的完整相对路径（如 "/周目模组服/xxx.zip"）
+   * @param filePath 文件相对站点根目录的完整路径（如 `/XMCL/0.2.0/xxx.zip`）
    * @param sign 下载签名
    * @param size 文件大小
-   * @returns 下载后的本地文件路径
+   * @returns 下载信息 JSON 字符串
    */
   async downloadFile(
     fileName: string,
@@ -109,11 +149,10 @@ export class OpenListAPI {
     sign: string,
     size: number
   ): Promise<string> {
-    console.log(`[OpenList API] Downloading file:`);
-    console.log(`  - Name: ${fileName}`);
-    console.log(`  - Path: ${filePath}`);
-    console.log(`  - Sign: ${sign}`);
-    console.log(`  - Size: ${size}`);
+    console.log("[download-site] 开始下载文件:");
+    console.log(`  - 名称: ${fileName}`);
+    console.log(`  - 路径: ${filePath}`);
+    console.log(`  - 大小: ${size}`);
 
     try {
       const downloadedPath = await invoke<string>("openlist_download_modpack", {
@@ -123,91 +162,19 @@ export class OpenListAPI {
         size,
       });
 
-      console.log(`[OpenList API] File downloaded to: ${downloadedPath}`);
+      console.log("[download-site] 下载任务已创建:", downloadedPath);
       return downloadedPath;
     } catch (error) {
-      console.error("[OpenList API] Download failed:", error);
+      console.error("[download-site] 下载失败:", error);
       throw new Error(`下载失败: ${error}`);
     }
   }
 
   /**
-   * 暂停下载
-   * @param filePath 文件路径
+   * 测试与下载站的连通性
    */
-  async pauseDownload(filePath: string): Promise<void> {
-    console.log(`[OpenList API] Pausing download: ${filePath}`);
-    await invoke("openlist_pause_download", { filePath });
-  }
-
-  /**
-   * 恢复下载
-   * @param filePath 文件路径
-   */
-  async resumeDownload(filePath: string): Promise<void> {
-    console.log(`[OpenList API] Resuming download: ${filePath}`);
-    await invoke("openlist_resume_download", { filePath });
-  }
-
-  /**
-   * 取消下载
-   * @param filePath 文件路径
-   */
-  async cancelDownload(filePath: string): Promise<void> {
-    console.log(`[OpenList API] Cancelling download: ${filePath}`);
-    await invoke("openlist_cancel_download", { filePath });
-  }
-
-  /**
-   * 获取下载状态
-   * @param filePath 文件路径
-   */
-  async getDownloadStatus(filePath: string): Promise<any> {
-    return await invoke("openlist_get_download_status", { filePath });
-  }
-
-  /**
-   * 添加离线下载任务
-   * 使用服务器端离线下载功能，适合大文件或网络不稳定的情况
-   * @param filePath 文件的完整相对路径（如 "/周目模组服/xxx.zip"）
-   * @param sign 下载签名
-   * @param destinationPath 目标保存路径（服务器上的路径，如 "/downloads"）
-   * @returns API响应
-   */
-  async addOfflineDownload(
-    filePath: string,
-    sign: string,
-    destinationPath: string = "/downloads"
-  ): Promise<{ code: number; message: string; data?: any }> {
-    console.log(`[OpenList API] Adding offline download task:`);
-    console.log(`  - File Path: ${filePath}`);
-    console.log(`  - Sign: ${sign}`);
-    console.log(`  - Destination: ${destinationPath}`);
-
-    // 构建下载 URL
-    const downloadUrl = sign
-      ? `${OPENLIST_BASE_URL}/d${filePath}?sign=${sign}`
-      : `${OPENLIST_BASE_URL}/d${filePath}`;
-
-    console.log(`  - Download URL: ${downloadUrl}`);
-
-    try {
-      const response = await invoke<{
-        code: number;
-        message: string;
-        data?: any;
-      }>("openlist_add_offline_download", {
-        path: destinationPath,
-        urls: [downloadUrl],
-        tool: "aria2", // 使用 aria2 作为默认下载工具
-      });
-
-      console.log(`[OpenList API] Offline download task created:`, response);
-      return response;
-    } catch (error) {
-      console.error("[OpenList API] Failed to create offline download:", error);
-      throw new Error(`创建离线下载任务失败: ${error}`);
-    }
+  async testConnection(): Promise<string> {
+    return await invoke<string>("test_openlist_connection");
   }
 }
 
